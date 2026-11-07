@@ -6,7 +6,7 @@ if (tg) {
 
 // Store Configuration
 const BOT_TOKEN = "9240762684:AAHSN8oFTAar5r827lbLeQnOKVy4ewxknmA";
-const ADMIN_CHAT_ID = "YOUR_ADMIN_ID_HERE"; // Replace with your numeric ID from @myidbot
+const ADMIN_CHAT_ID = "7452255045"; // Replace with your numeric ID from @myidbot
 
 // Catalog items
 let products = [

@@ -1,9 +1,11 @@
 import sqlite3
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-DB_PATH = "store.db"
+# Reliable path inside the bot directory
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store.db")
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -22,7 +24,7 @@ def init_db():
         name TEXT NOT NULL,
         category TEXT NOT NULL,
         price REAL NOT NULL,
-        specs TEXT, -- JSON string for key-value specs
+        specs TEXT,
         stock_count INTEGER NOT NULL DEFAULT 0,
         image_url TEXT,
         is_active INTEGER NOT NULL DEFAULT 1
@@ -37,10 +39,10 @@ def init_db():
         phone_number TEXT NOT NULL,
         delivery_address TEXT NOT NULL,
         delivery_notes TEXT,
-        payment_method TEXT NOT NULL, -- 'COD' or 'MOBILE_MONEY'
+        payment_method TEXT NOT NULL,
         payment_reference TEXT,
-        payment_status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING, VERIFIED, FAILED
-        order_status TEXT NOT NULL DEFAULT 'NEW',       -- NEW, CONFIRMED, DISPATCHED, DELIVERED, CANCELLED
+        payment_status TEXT NOT NULL DEFAULT 'PENDING',
+        order_status TEXT NOT NULL DEFAULT 'NEW',
         total_amount REAL NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -59,8 +61,24 @@ def init_db():
         FOREIGN KEY (product_id) REFERENCES products(id)
     );
     """)
-    
     conn.commit()
+
+    # Automatically seed the initial inventory if empty
+    cursor.execute("SELECT COUNT(*) as count FROM products")
+    if cursor.fetchone()["count"] == 0:
+        default_items = [
+            (1, "CHG-65W-GAN", "65W GaN Dual USB-C Fast Charger", "Chargers", 38.99, json.dumps({"Ports": "2x USB-C, 1x USB-A", "Tech": "GaN III", "Power": "65W Max"}), 25, "https://images.unsplash.com/photo-1583863788434-e58a36330cf0?w=600&auto=format&fit=crop&q=80"),
+            (2, "CBL-TB4-2M", "Braided Thunderbolt 4 / USB-C Cable (2m)", "Cables", 24.50, json.dumps({"Bandwidth": "40Gbps", "Length": "2 meters", "Power": "100W PD"}), 50, "https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=600&auto=format&fit=crop&q=80"),
+            (3, "SSD-NVME-1TB", "Rugged Portable NVMe SSD (1TB)", "Storage", 109.00, json.dumps({"Read Speed": "1050 MB/s", "Durability": "IP55 Water/Dust", "Interface": "USB 3.2 Gen 2"}), 14, "https://images.unsplash.com/photo-1597872200969-2b65d56bd16b?w=600&auto=format&fit=crop&q=80"),
+            (4, "AUD-ANC-PRO", "Hi-Res Wireless ANC Earbuds", "Audio Gear", 89.95, json.dumps({"ANC": "Hybrid Active", "Battery": "32h total", "Codec": "LDAC / AAC"}), 18, "https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=600&auto=format&fit=crop&q=80"),
+            (5, "ADP-8IN1-HUB", "8-in-1 Aluminium USB-C Hub Adapter", "Adapters", 45.00, json.dumps({"HDMI": "4K @ 60Hz", "Ethernet": "Gigabit", "Card Reader": "SD/TF"}), 30, "https://images.unsplash.com/photo-1625842268584-8f3296236761?w=600&auto=format&fit=crop&q=80")
+        ]
+        cursor.executemany("""
+        INSERT INTO products (id, sku, name, category, price, specs, stock_count, image_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, default_items)
+        conn.commit()
+
     conn.close()
 
 def create_order(
@@ -74,10 +92,9 @@ def create_order(
 ) -> int:
     conn = get_connection()
     cursor = conn.cursor()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     
     try:
-        # Calculate total and verify inventory
         total_amount = 0.0
         for item in items:
             cursor.execute("SELECT price, stock_count FROM products WHERE id = ?", (item["product_id"],))
@@ -88,7 +105,6 @@ def create_order(
                 raise ValueError(f"Insufficient stock for product ID {item['product_id']}.")
             total_amount += row["price"] * item["quantity"]
 
-        # Insert Order
         cursor.execute("""
             INSERT INTO orders (
                 telegram_user_id, customer_name, phone_number,
@@ -102,7 +118,6 @@ def create_order(
         ))
         order_id = cursor.lastrowid
 
-        # Insert Items & Decrement Stock
         for item in items:
             cursor.execute("SELECT price FROM products WHERE id = ?", (item["product_id"],))
             unit_price = cursor.fetchone()["price"]
@@ -150,7 +165,7 @@ def get_order_by_id(order_id: int) -> Optional[Dict[str, Any]]:
 def update_payment_ref(order_id: int, ref_code: str):
     conn = get_connection()
     cursor = conn.cursor()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     cursor.execute("""
         UPDATE orders 
         SET payment_reference = ?, payment_status = 'SUBMITTED', updated_at = ?

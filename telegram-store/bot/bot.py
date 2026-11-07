@@ -1,35 +1,29 @@
 import os
 import json
 import logging
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
 from telegram import (
     Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     WebAppInfo,
-    ReplyKeyboardMarkup,
-    KeyboardButton
 )
-from telegram.constants import ParseMode
-from telegram.request import HTTPXRequest
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
     ContextTypes,
-    filters
 )
-
-from database import init_db, create_order, get_order_by_id, update_payment_ref
-
-# Load environment variables
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", "")
-MOBILE_MONEY_DETAILS = os.getenv(
-    "MOBILE_MONEY_DETAILS", 
-    "Transfer to Merchant ID: 882910 (VoltTech Supply). Use your Order ID as reference."
+from database import (
+    init_db,
+    add_product,
+    delete_product,
+    get_active_products,
+    create_order,
+    get_order_by_id,
+    update_payment_ref,
 )
 
 logging.basicConfig(
@@ -38,197 +32,265 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Lightweight HTTP Health Check server for Cloud Hosts (Render)
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"VoltTech Bot is running 24/7.")
-    def log_message(self, format, *args):
-        return
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 
-def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Health server listening on port {port}")
-    server.serve_forever()
+# Conversation states for /addproduct
+(
+    WAITING_NAME,
+    WAITING_CATEGORY,
+    WAITING_PRICE,
+    WAITING_STOCK,
+    WAITING_SPECS,
+    WAITING_PHOTO,
+) = range(6)
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_CHAT_ID
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_first_name = update.effective_user.first_name or "there"
     welcome_text = (
-        f"Hello, {user.first_name}!\n\n"
-        "Welcome to *VoltTech Hardware Store* ⚡\n"
-        "Browse our catalog of fast chargers, Thunderbolt cables, NVMe drives, and adapters.\n\n"
-        "Tap the button below to launch our store app."
+        f"👋 Welcome to the store, {user_first_name}!\n\n"
+        "Browse our collection and place orders directly in the WebApp below."
     )
-    
-    reply_kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("🛍️ Open Store", web_app=WebAppInfo(url=WEBAPP_URL))]],
-        resize_keyboard=True
-    )
+
+    keyboard = [
+        [InlineKeyboardButton("🛍️ Open Store", web_app=WebAppInfo(url=WEBAPP_URL))]
+    ]
+    if is_admin(update.effective_user.id):
+        welcome_text += "\n\n🛠️ *Admin Controls:*\n/addproduct - Add a new item\n/deleteproduct - Deactivate an item\n/catalog - View current stock"
 
     await update.message.reply_text(
-        text=welcome_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_kb
+        welcome_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
 
+
 async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-
+    """Processes order payloads sent from the Telegram Mini App."""
     try:
-        data = json.loads(message.web_app_data.data)
-        if data.get("action") != "SUBMIT_ORDER":
-            logger.warning(f"Unknown action received: {data.get('action')}")
-            return
-
+        raw_data = update.effective_message.web_app_data.data
+        data = json.loads(raw_data)
+        
+        customer_info = data.get("customer", {})
+        items = data.get("items", [])
+        
         order_id = create_order(
-            telegram_user_id=user.id,
-            customer_name=data["customer_name"],
-            phone_number=data["phone_number"],
-            delivery_address=data["delivery_address"],
-            delivery_notes=data.get("delivery_notes", ""),
-            payment_method=data["payment_method"],
-            items=data["items"]
+            telegram_user_id=update.effective_user.id,
+            customer_name=customer_info.get("name", "Unknown"),
+            phone_number=customer_info.get("phone", ""),
+            delivery_address=customer_info.get("address", ""),
+            delivery_notes=customer_info.get("notes", ""),
+            payment_method=data.get("payment_method", "MOBILE_MONEY"),
+            items=items
         )
 
         order = get_order_by_id(order_id)
-        if not order:
-            await message.reply_text("Failed to retrieve order details.")
-            return
+        total = float(order["total_amount"])
 
-        items_summary = "\n".join([
-            f"• {item['product_name']} (x{item['quantity']}) — ${item['subtotal']:.2f}"
-            for item in order["items"]
-        ])
-
-        receipt_text = (
-            f"✅ *Order Confirmed!* `#{order['id']:04d}`\n\n"
-            f"*Customer:* {order['customer_name']}\n"
-            f"*Phone:* `{order['phone_number']}`\n"
-            f"*Delivery To:* {order['delivery_address']}\n"
+        customer_msg = (
+            f"✅ *Order #{order_id} Confirmed!*\n\n"
+            f"💰 *Total:* {total:,.2f} ETB\n"
+            f"📍 *Delivery to:* {order['delivery_address']}\n"
+            f"📞 *Phone:* {order['phone_number']}\n\n"
+            "💳 *Payment Instructions:*\n"
+            "Please send the total via Telebirr or CBE to:\n"
+            "📱 Telebirr: `0918012966`\n\n"
+            "After payment, reply to this chat with your transaction reference number or a screenshot slip."
         )
-        if order["delivery_notes"]:
-            receipt_text += f"*Notes:* {order['delivery_notes']}\n"
+        await update.message.reply_text(customer_msg, parse_mode="Markdown")
 
-        receipt_text += (
-            f"\n*Itemized Items:*\n{items_summary}\n\n"
-            f"*Total Sum:* `${order['total_amount']:.2f}`\n"
-            f"*Payment Method:* `{order['payment_method']}`\n"
-        )
-
-        if order["payment_method"] == "MOBILE_MONEY":
-            receipt_text += (
-                f"\n⚠️ *Payment Required:*\n"
-                f"{MOBILE_MONEY_DETAILS}\n"
-                f"Once paid, reply to this chat with your transaction code or screenshot."
-            )
-        else:
-            receipt_text += "\n💵 Please keep exact cash ready upon arrival of the delivery courier."
-
-        await message.reply_text(receipt_text, parse_mode=ParseMode.MARKDOWN)
-
+        # Notify Admin
         if ADMIN_CHAT_ID:
-            admin_alert = (
-                f"🚨 *NEW ORDER NOTIFICATION* `#{order['id']:04d}`\n\n"
-                f"*Customer:* {order['customer_name']} ([TG Profile](tg://user?id={user.id}))\n"
-                f"*Phone:* `{order['phone_number']}`\n"
-                f"*Address:* {order['delivery_address']}\n"
-                f"*Items:*\n{items_summary}\n\n"
-                f"*Total:* `${order['total_amount']:.2f}`\n"
-                f"*Payment:* `{order['payment_method']}`"
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=admin_alert,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.error(f"Failed to send admin order alert: {e}")
-
-    except Exception as e:
-        logger.error(f"Error executing order processing: {e}", exc_info=True)
-        await message.reply_text("An error occurred while verifying the order. Please contact support.")
-
-async def handle_user_text_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user_text = message.text.strip()
-    user = update.effective_user
-
-    if len(user_text) >= 4 and not user_text.startswith("/"):
-        await message.reply_text(
-            f"✅ Payment reference received: `{user_text}`.\nOur team is verifying the transfer and will confirm shortly!",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        if ADMIN_CHAT_ID:
-            admin_notice = (
-                f"💳 *Payment Reference Submitted*\n\n"
-                f"*From Customer:* {user.full_name} ([TG Profile](tg://user?id={user.id}))\n"
-                f"*Reference Code:* `{user_text}`\n\n"
-                f"Check your banking app / Telebirr to confirm deposit."
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=admin_notice,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.error(f"Failed to send admin reference alert: {e}")
-
-async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-
-    await message.reply_text(
-        "✅ Receipt screenshot received! Our team is verifying your payment and preparing your package.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.forward_message(
-                chat_id=ADMIN_CHAT_ID,
-                from_chat_id=message.chat_id,
-                message_id=message.message_id
+            admin_msg = (
+                f"🚨 *New Order Alert: #{order_id}*\n"
+                f"👤 *Customer:* {order['customer_name']} (@{update.effective_user.username or 'NoUsername'})\n"
+                f"📱 *Phone:* {order['phone_number']}\n"
+                f"📍 *Address:* {order['delivery_address']}\n"
+                f"💵 *Amount:* {total:,.2f} ETB\n"
+                f"📦 *Items:* {len(order.get('items', []))} item(s)"
             )
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"📸 *Payment Slip* received from {user.full_name} ([TG Profile](tg://user?id={user.id})).",
-                parse_mode=ParseMode.MARKDOWN
+                text=admin_msg,
+                parse_mode="Markdown"
             )
-        except Exception as e:
-            logger.error(f"Failed to relay screenshot to admin: {e}")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Exception while handling an update: {context.error}")
+    except Exception as e:
+        logger.error(f"Error handling WebApp data: {e}", exc_info=True)
+        await update.message.reply_text("❌ An error occurred while saving your order. Please try again.")
+
+
+# ------------------ ADMIN INVENTORY FLOWS ------------------
+
+async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+
+    products = get_active_products()
+    if not products:
+        await update.message.reply_text("No active products currently in the catalog.")
+        return
+
+    text = "📦 *Current Active Catalog:*\n\n"
+    for p in products:
+        text += f"• *ID #{p['id']}* — {p['name']}\n  Price: {float(p['price']):,.2f} ETB | Stock: {p['stock_count']}\n\n"
+    text += "To deactivate an item: `/deleteproduct <id>`"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def delete_product_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/deleteproduct <id>`\nExample: `/deleteproduct 3`", parse_mode="Markdown")
+        return
+
+    try:
+        pid = int(context.args[0])
+        success = delete_product(pid)
+        if success:
+            await update.message.reply_text(f"🗑️ Product #{pid} was successfully deactivated.")
+        else:
+            await update.message.reply_text(f"❌ Product #{pid} not found.")
+    except ValueError:
+        await update.message.reply_text("Please provide a valid numeric product ID.")
+
+
+# Conversation handler for /addproduct
+async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("📝 Step 1/6: Enter the *Product Name*:\n(or send /cancel to abort)", parse_mode="Markdown")
+    return WAITING_NAME
+
+
+async def add_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_p_name"] = update.message.text.strip()
+    await update.message.reply_text("🏷️ Step 2/6: Enter the *Category* (e.g., Chargers, Cables, Audio, Storage):", parse_mode="Markdown")
+    return WAITING_CATEGORY
+
+
+async def add_product_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_p_cat"] = update.message.text.strip()
+    await update.message.reply_text("💵 Step 3/6: Enter the *Price in Birr (ETB)* (e.g., 2500):", parse_mode="Markdown")
+    return WAITING_PRICE
+
+
+async def add_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = float(update.message.text.strip())
+        context.user_data["new_p_price"] = price
+        await update.message.reply_text("📦 Step 4/6: Enter the *Stock Quantity* (e.g., 20):", parse_mode="Markdown")
+        return WAITING_STOCK
+    except ValueError:
+        await update.message.reply_text("❌ Please enter a valid number for price (e.g., 1800 or 2450.50):")
+        return WAITING_PRICE
+
+
+async def add_product_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        stock = int(update.message.text.strip())
+        context.user_data["new_p_stock"] = stock
+        await update.message.reply_text("📋 Step 5/6: Enter *Short Specs / Description*:\n(e.g., '65W GaN Fast Charging, Dual Port')", parse_mode="Markdown")
+        return WAITING_SPECS
+    except ValueError:
+        await update.message.reply_text("❌ Please enter a whole number for stock quantity:")
+        return WAITING_STOCK
+
+
+async def add_product_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_p_specs"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🖼️ Step 6/6: Send a *Photo* of the item, or send an image URL text:\n(or send /skip for placeholder)",
+        parse_mode="Markdown"
+    )
+    return WAITING_PHOTO
+
+
+async def add_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    image_url = "https://images.unsplash.com/photo-1583863788434-e58a36330cf0?w=600&auto=format&fit=crop&q=80"
+
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        image_url = file.file_path
+    elif update.message.text and update.message.text.startswith("http"):
+        image_url = update.message.text.strip()
+
+    pid = add_product(
+        name=context.user_data["new_p_name"],
+        category=context.user_data["new_p_cat"],
+        price=context.user_data["new_p_price"],
+        stock_count=context.user_data["new_p_stock"],
+        specs=context.user_data["new_p_specs"],
+        image_url=image_url,
+    )
+
+    await update.message.reply_text(
+        f"🎉 *Product Added Successfully!*\n\n"
+        f"• *ID:* #{pid}\n"
+        f"• *Name:* {context.user_data['new_p_name']}\n"
+        f"• *Price:* {context.user_data['new_p_price']:,.2f} ETB\n"
+        f"• *Stock:* {context.user_data['new_p_stock']}\n\n"
+        "It is now stored in your Supabase database.",
+        parse_mode="Markdown"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("🚫 Product creation cancelled.")
+    return ConversationHandler.END
+
 
 def main():
     init_db()
-
-    threading.Thread(target=start_health_server, daemon=True).start()
-
-    request_config = HTTPXRequest(
-        connection_pool_size=10,
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0
-    )
-
-    app = ApplicationBuilder().token(BOT_TOKEN).request(request_config).build()
     
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text_replies))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
-    app.add_error_handler(error_handler)
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    logger.info("Bot started successfully. Waiting for orders and screenshots...")
-    app.run_polling(drop_pending_updates=True)
+    # Core user handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
+
+    # Admin commands
+    app.add_handler(CommandHandler("catalog", catalog))
+    app.add_handler(CommandHandler("deleteproduct", delete_product_cmd))
+
+    # Interactive /addproduct wizard
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("addproduct", add_product_start)],
+        states={
+            WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
+            WAITING_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_category)],
+            WAITING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_price)],
+            WAITING_STOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_stock)],
+            WAITING_SPECS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_specs)],
+            WAITING_PHOTO: [
+                MessageHandler(filters.PHOTO, add_product_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_photo),
+                CommandHandler("skip", add_product_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    app.add_handler(conv_handler)
+
+    logger.info("Bot started and listening...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()

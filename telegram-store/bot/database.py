@@ -1,16 +1,15 @@
-import sqlite3
-import json
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-# Reliable path inside the bot directory
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
+def get_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is not set.")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     return conn
 
 def init_db():
@@ -19,22 +18,22 @@ def init_db():
     
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sku TEXT UNIQUE NOT NULL,
+        id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         category TEXT NOT NULL,
-        price REAL NOT NULL,
-        specs TEXT,
+        price NUMERIC(10, 2) NOT NULL,
         stock_count INTEGER NOT NULL DEFAULT 0,
+        specs TEXT,
         image_url TEXT,
-        is_active INTEGER NOT NULL DEFAULT 1
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
     );
     """)
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_user_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        telegram_user_id BIGINT NOT NULL,
         customer_name TEXT NOT NULL,
         phone_number TEXT NOT NULL,
         delivery_address TEXT NOT NULL,
@@ -43,43 +42,63 @@ def init_db():
         payment_reference TEXT,
         payment_status TEXT NOT NULL DEFAULT 'PENDING',
         order_status TEXT NOT NULL DEFAULT 'NEW',
-        total_amount REAL NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        total_amount NUMERIC(10, 2) NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
     );
     """)
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+        product_id INTEGER REFERENCES products(id),
         quantity INTEGER NOT NULL,
-        unit_price REAL NOT NULL,
-        subtotal REAL NOT NULL,
-        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
-        FOREIGN KEY (product_id) REFERENCES products(id)
+        unit_price NUMERIC(10, 2) NOT NULL,
+        subtotal NUMERIC(10, 2) NOT NULL
     );
     """)
     conn.commit()
-
-    # Automatically seed the initial inventory if empty
-    cursor.execute("SELECT COUNT(*) as count FROM products")
-    if cursor.fetchone()["count"] == 0:
-        default_items = [
-            (1, "CHG-65W-GAN", "65W GaN Dual USB-C Fast Charger", "Chargers", 38.99, json.dumps({"Ports": "2x USB-C, 1x USB-A", "Tech": "GaN III", "Power": "65W Max"}), 25, "https://images.unsplash.com/photo-1583863788434-e58a36330cf0?w=600&auto=format&fit=crop&q=80"),
-            (2, "CBL-TB4-2M", "Braided Thunderbolt 4 / USB-C Cable (2m)", "Cables", 24.50, json.dumps({"Bandwidth": "40Gbps", "Length": "2 meters", "Power": "100W PD"}), 50, "https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=600&auto=format&fit=crop&q=80"),
-            (3, "SSD-NVME-1TB", "Rugged Portable NVMe SSD (1TB)", "Storage", 109.00, json.dumps({"Read Speed": "1050 MB/s", "Durability": "IP55 Water/Dust", "Interface": "USB 3.2 Gen 2"}), 14, "https://images.unsplash.com/photo-1597872200969-2b65d56bd16b?w=600&auto=format&fit=crop&q=80"),
-            (4, "AUD-ANC-PRO", "Hi-Res Wireless ANC Earbuds", "Audio Gear", 89.95, json.dumps({"ANC": "Hybrid Active", "Battery": "32h total", "Codec": "LDAC / AAC"}), 18, "https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=600&auto=format&fit=crop&q=80"),
-            (5, "ADP-8IN1-HUB", "8-in-1 Aluminium USB-C Hub Adapter", "Adapters", 45.00, json.dumps({"HDMI": "4K @ 60Hz", "Ethernet": "Gigabit", "Card Reader": "SD/TF"}), 30, "https://images.unsplash.com/photo-1625842268584-8f3296236761?w=600&auto=format&fit=crop&q=80")
-        ]
-        cursor.executemany("""
-        INSERT INTO products (id, sku, name, category, price, specs, stock_count, image_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, default_items)
-        conn.commit()
-
     conn.close()
+
+def add_product(name: str, category: str, price: float, stock_count: int, specs: str, image_url: str) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO products (name, category, price, stock_count, specs, image_url, is_active)
+        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+        RETURNING id;
+    """, (name, category, price, stock_count, specs, image_url))
+    new_id = cursor.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return new_id
+
+def delete_product(product_id: int) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE products 
+        SET is_active = FALSE 
+        WHERE id = %s RETURNING id;
+    """, (product_id,))
+    row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    return row is not None
+
+def get_active_products() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, category, price, stock_count, specs, image_url 
+        FROM products 
+        WHERE is_active = TRUE 
+        ORDER BY id ASC;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 def create_order(
     telegram_user_id: int,
@@ -92,46 +111,47 @@ def create_order(
 ) -> int:
     conn = get_connection()
     cursor = conn.cursor()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     
     try:
         total_amount = 0.0
         for item in items:
-            cursor.execute("SELECT price, stock_count FROM products WHERE id = ?", (item["product_id"],))
+            cursor.execute("SELECT price, stock_count FROM products WHERE id = %s AND is_active = TRUE", (item["product_id"],))
             row = cursor.fetchone()
             if not row:
-                raise ValueError(f"Product ID {item['product_id']} not found.")
+                raise ValueError(f"Product ID {item['product_id']} not found or inactive.")
             if row["stock_count"] < item["quantity"]:
                 raise ValueError(f"Insufficient stock for product ID {item['product_id']}.")
-            total_amount += row["price"] * item["quantity"]
+            total_amount += float(row["price"]) * item["quantity"]
 
         cursor.execute("""
             INSERT INTO orders (
                 telegram_user_id, customer_name, phone_number,
                 delivery_address, delivery_notes, payment_method,
                 total_amount, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id;
         """, (
             telegram_user_id, customer_name, phone_number,
             delivery_address, delivery_notes, payment_method,
             total_amount, now, now
         ))
-        order_id = cursor.lastrowid
+        order_id = cursor.fetchone()["id"]
 
         for item in items:
-            cursor.execute("SELECT price FROM products WHERE id = ?", (item["product_id"],))
-            unit_price = cursor.fetchone()["price"]
+            cursor.execute("SELECT price FROM products WHERE id = %s", (item["product_id"],))
+            unit_price = float(cursor.fetchone()["price"])
             subtotal = unit_price * item["quantity"]
             
             cursor.execute("""
                 INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
             """, (order_id, item["product_id"], item["quantity"], unit_price, subtotal))
             
             cursor.execute("""
                 UPDATE products 
-                SET stock_count = stock_count - ? 
-                WHERE id = ?
+                SET stock_count = stock_count - %s 
+                WHERE id = %s
             """, (item["quantity"], item["product_id"]))
 
         conn.commit()
@@ -145,7 +165,7 @@ def create_order(
 def get_order_by_id(order_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+    cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
     order_row = cursor.fetchone()
     if not order_row:
         conn.close()
@@ -153,10 +173,10 @@ def get_order_by_id(order_id: int) -> Optional[Dict[str, Any]]:
     
     order = dict(order_row)
     cursor.execute("""
-        SELECT oi.*, p.name as product_name, p.sku 
+        SELECT oi.*, p.name as product_name 
         FROM order_items oi
         JOIN products p ON oi.product_id = p.id
-        WHERE oi.order_id = ?
+        WHERE oi.order_id = %s
     """, (order_id,))
     order["items"] = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -165,11 +185,11 @@ def get_order_by_id(order_id: int) -> Optional[Dict[str, Any]]:
 def update_payment_ref(order_id: int, ref_code: str):
     conn = get_connection()
     cursor = conn.cursor()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     cursor.execute("""
         UPDATE orders 
-        SET payment_reference = ?, payment_status = 'SUBMITTED', updated_at = ?
-        WHERE id = ?
+        SET payment_reference = %s, payment_status = 'SUBMITTED', updated_at = %s
+        WHERE id = %s
     """, (ref_code, now, order_id))
     conn.commit()
     conn.close()

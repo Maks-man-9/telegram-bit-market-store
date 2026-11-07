@@ -4,7 +4,7 @@ if (tg) {
   tg.expand();
 }
 
-// Hardcoded products so it doesn't rely on fetch()
+// Hardcoded catalog items
 let products = [
   {
     "id": 1,
@@ -61,7 +61,7 @@ let products = [
 let cart = {}; 
 let selectedCategory = "All";
 
-// Elements
+// DOM Elements
 const productsGrid = document.getElementById("productsGrid");
 const categoryContainer = document.getElementById("categoryContainer");
 const searchInput = document.getElementById("searchInput");
@@ -96,6 +96,7 @@ function renderCategories() {
   const categories = ["All", ...new Set(products.map(p => p.category))];
   categoryContainer.innerHTML = categories.map(cat => `
     <button 
+      type="button"
       class="px-3 py-1.5 rounded-lg whitespace-nowrap transition ${
         selectedCategory === cat 
           ? 'bg-brand text-white font-medium' 
@@ -158,14 +159,14 @@ function renderProducts() {
           <span class="font-bold text-sm text-white">$${product.price.toFixed(2)}</span>
           
           ${qty === 0 ? `
-            <button onclick="updateQty(${product.id}, 1)" class="bg-brand hover:bg-blue-600 text-white text-xs px-3 py-1.5 rounded-lg transition font-medium">
+            <button type="button" onclick="updateQty(${product.id}, 1)" class="bg-brand hover:bg-blue-600 text-white text-xs px-3 py-1.5 rounded-lg transition font-medium">
               + Add
             </button>
           ` : `
             <div class="flex items-center bg-background border border-border rounded-lg">
-              <button onclick="updateQty(${product.id}, -1)" class="px-2.5 py-1 text-zinc-300 hover:text-white text-xs">-</button>
+              <button type="button" onclick="updateQty(${product.id}, -1)" class="px-2.5 py-1 text-zinc-300 hover:text-white text-xs">-</button>
               <span class="px-2 text-xs font-semibold text-white">${qty}</span>
-              <button onclick="updateQty(${product.id}, 1)" class="px-2.5 py-1 text-zinc-300 hover:text-white text-xs">+</button>
+              <button type="button" onclick="updateQty(${product.id}, 1)" class="px-2.5 py-1 text-zinc-300 hover:text-white text-xs">+</button>
             </div>
           `}
         </div>
@@ -232,9 +233,9 @@ function renderCartDrawer() {
           <p class="text-[11px] text-zinc-400 font-mono">$${product.price.toFixed(2)} × ${qty} = $${subtotal.toFixed(2)}</p>
         </div>
         <div class="flex items-center bg-surface border border-border rounded-lg">
-          <button onclick="updateQty(${product.id}, -1)" class="px-2 py-0.5 text-zinc-400 hover:text-white text-xs">-</button>
+          <button type="button" onclick="updateQty(${product.id}, -1)" class="px-2 py-0.5 text-zinc-400 hover:text-white text-xs">-</button>
           <span class="px-2 text-xs font-mono font-medium">${qty}</span>
-          <button onclick="updateQty(${product.id}, 1)" class="px-2 py-0.5 text-zinc-400 hover:text-white text-xs">+</button>
+          <button type="button" onclick="updateQty(${product.id}, 1)" class="px-2 py-0.5 text-zinc-400 hover:text-white text-xs">+</button>
         </div>
       </div>
     `;
@@ -245,10 +246,12 @@ function renderCartDrawer() {
 
 function bindEvents() {
   searchInput.addEventListener("input", renderProducts);
+  
   cartBtn.addEventListener("click", () => {
     renderCartDrawer();
     cartModal.classList.remove("hidden");
   });
+  
   closeCartBtn.addEventListener("click", () => cartModal.classList.add("hidden"));
 
   toCheckoutBtn.addEventListener("click", () => {
@@ -269,6 +272,11 @@ function bindEvents() {
       quantity: cart[id]
     }));
 
+    if (itemsPayload.length === 0) {
+      if (tg?.showAlert) tg.showAlert("Your cart is empty.");
+      return;
+    }
+
     const payload = {
       action: "SUBMIT_ORDER",
       customer_name: document.getElementById("custName").value.trim(),
@@ -281,8 +289,13 @@ function bindEvents() {
 
     if (tg && tg.sendData) {
       tg.sendData(JSON.stringify(payload));
+      try {
+        tg.close();
+      } catch (err) {
+        console.error("Window close error:", err);
+      }
     } else {
-      alert("Order submitted:\n" + JSON.stringify(payload, null, 2));
+      alert("Order submitted locally:\n" + JSON.stringify(payload, null, 2));
     }
   });
 }

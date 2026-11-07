@@ -4,7 +4,11 @@ if (tg) {
   tg.expand();
 }
 
-// Hardcoded catalog items
+// Store Configuration
+const BOT_TOKEN = "9240762684:AAHSN8oFTAar5r827lbLeQnOKVy4ewxknmA";
+const ADMIN_CHAT_ID = "YOUR_ADMIN_ID_HERE"; // Replace with your numeric ID from @myidbot
+
+// Catalog items
 let products = [
   {
     "id": 1,
@@ -75,6 +79,7 @@ const toCheckoutBtn = document.getElementById("toCheckoutBtn");
 const checkoutModal = document.getElementById("checkoutModal");
 const closeCheckoutBtn = document.getElementById("closeCheckoutBtn");
 const checkoutForm = document.getElementById("checkoutForm");
+const submitOrderBtn = document.getElementById("submitOrderBtn");
 
 function init() {
   renderCategories();
@@ -244,6 +249,22 @@ function renderCartDrawer() {
   cartTotalPrice.textContent = `$${total.toFixed(2)}`;
 }
 
+async function sendTelegramMessage(chatId, text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: "Markdown"
+      })
+    });
+  } catch (err) {
+    console.error("API dispatch error:", err);
+  }
+}
+
 function bindEvents() {
   searchInput.addEventListener("input", renderProducts);
   
@@ -264,39 +285,78 @@ function bindEvents() {
     cartModal.classList.remove("hidden");
   });
 
-  checkoutForm.addEventListener("submit", (e) => {
+  checkoutForm.addEventListener("submit", async (e) => {
     e.preventDefault();
 
-    const itemsPayload = Object.keys(cart).map(id => ({
-      product_id: parseInt(id),
-      quantity: cart[id]
-    }));
+    const customerName = document.getElementById("custName").value.trim();
+    const phone = document.getElementById("custPhone").value.trim();
+    const address = document.getElementById("custAddress").value.trim();
+    const notes = document.getElementById("custNotes").value.trim();
+    const paymentMethod = document.querySelector('input[name="paymentMethod"]:checked').value;
+    const userId = tg?.initDataUnsafe?.user?.id;
 
-    if (itemsPayload.length === 0) {
-      if (tg?.showAlert) tg.showAlert("Your cart is empty.");
-      return;
+    let total = 0;
+    let itemsText = "";
+    for (const [id, qty] of Object.entries(cart)) {
+      const p = products.find(prod => prod.id === parseInt(id));
+      const sub = p.price * qty;
+      total += sub;
+      itemsText += `• ${p.name} (x${qty}) — $${sub.toFixed(2)}\n`;
     }
 
-    const payload = {
-      action: "SUBMIT_ORDER",
-      customer_name: document.getElementById("custName").value.trim(),
-      phone_number: document.getElementById("custPhone").value.trim(),
-      delivery_address: document.getElementById("custAddress").value.trim(),
-      delivery_notes: document.getElementById("custNotes").value.trim(),
-      payment_method: document.querySelector('input[name="paymentMethod"]:checked').value,
-      items: itemsPayload
-    };
+    submitOrderBtn.disabled = true;
+    submitOrderBtn.innerHTML = "<span>Processing order...</span>";
 
-    if (tg && tg.sendData) {
-      tg.sendData(JSON.stringify(payload));
+    // 1. Receipt Message
+    let receipt = `✅ *Order Placed Successfully!*\n\n` +
+      `*Customer:* ${customerName}\n` +
+      `*Phone:* \`${phone}\`\n` +
+      `*Delivery To:* ${address}\n`;
+    if (notes) receipt += `*Notes:* ${notes}\n`;
+    receipt += `\n*Items:*\n${itemsText}\n` +
+      `*Total Amount:* \`$${total.toFixed(2)}\`\n` +
+      `*Payment Method:* \`${paymentMethod}\`\n`;
+
+    if (paymentMethod === "MOBILE_MONEY") {
+      receipt += `\n⚠️ *Payment Required:*\nTransfer to Merchant ID: \`882910\`. Reply with your screenshot or transaction ID here.`;
+    } else {
+      receipt += `\n💵 Please have exact cash ready for the courier.`;
+    }
+
+    // 2. Admin Alert Message
+    let adminAlert = `🚨 *NEW ORDER RECEIVED*\n\n` +
+      `*Customer:* ${customerName} (${userId ? `[TG Profile](tg://user?id=${userId})` : "Direct"})\n` +
+      `*Phone:* \`${phone}\`\n` +
+      `*Address:* ${address}\n` +
+      `\n*Items:*\n${itemsText}\n` +
+      `*Total:* \`$${total.toFixed(2)}\`\n` +
+      `*Payment:* \`${paymentMethod}\``;
+
+    // Send customer receipt
+    if (userId) {
+      await sendTelegramMessage(userId, receipt);
+    }
+
+    // Send admin notification
+    if (ADMIN_CHAT_ID && ADMIN_CHAT_ID !== "YOUR_ADMIN_ID_HERE") {
+      await sendTelegramMessage(ADMIN_CHAT_ID, adminAlert);
+    }
+
+    // Attempt native sendData fallback
+    try {
+      if (tg?.sendData) {
+        tg.sendData(JSON.stringify({ status: "SUCCESS" }));
+      }
+    } catch (_) {}
+
+    // Close window
+    setTimeout(() => {
       try {
         tg.close();
       } catch (err) {
-        console.error("Window close error:", err);
+        window.close();
       }
-    } else {
-      alert("Order submitted locally:\n" + JSON.stringify(payload, null, 2));
-    }
+    }, 600);
   });
 }
 

@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import (
@@ -37,17 +38,30 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 
-# --- Combined Health Check & API Server for Render ---
+bot_app: Application = None
+main_loop: asyncio.AbstractEventLoop = None
+
+
+# --- Combined Health Check & Order API Server ---
 class WebRequestHandler(BaseHTTPRequestHandler):
+    def _send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._send_cors_headers()
+        self.end_headers()
+
     def do_GET(self):
         if self.path == "/api/products":
             try:
                 products = get_active_products()
                 payload = json.dumps(products).encode("utf-8")
-                
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self._send_cors_headers()
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -56,21 +70,112 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 err_payload = json.dumps({"error": str(e)}).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Length", str(len(err_payload)))
+                self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(err_payload)
         else:
-            # Standard health check endpoint for Render
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cors_headers()
             self.end_headers()
             self.wfile.write(b"OK")
 
+    def do_POST(self):
+        if self.path == "/api/order":
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len)
+                data = json.loads(body.decode("utf-8"))
+
+                user_id = int(data.get("user_id", 0))
+                customer_info = data.get("customer", {})
+                items = data.get("items", [])
+                payment_method = data.get("payment_method", "MOBILE_MONEY")
+
+                order_id = create_order(
+                    telegram_user_id=user_id,
+                    customer_name=customer_info.get("name", "Unknown"),
+                    phone_number=customer_info.get("phone", ""),
+                    delivery_address=customer_info.get("address", ""),
+                    delivery_notes=customer_info.get("notes", ""),
+                    payment_method=payment_method,
+                    items=items,
+                )
+
+                order = get_order_by_id(order_id)
+                total = float(order["total_amount"])
+
+                # Dispatch notifications asynchronously via Telegram
+                if bot_app and main_loop:
+                    asyncio.run_coroutine_threadsafe(
+                        notify_order_created(order, user_id, total),
+                        main_loop
+                    )
+
+                resp = json.dumps({"status": "success", "order_id": order_id}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors_headers()
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            except Exception as e:
+                logger.error(f"Error creating order via API: {e}", exc_info=True)
+                err_resp = json.dumps({"status": "error", "message": str(e)}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(err_resp)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, format, *args):
-        # Silence routine health checks from cluttering the terminal
         return
+
+
+async def notify_order_created(order: dict, user_id: int, total: float):
+    # Customer message
+    customer_msg = (
+        f"✅ *Order #{order['id']} Confirmed!*\n\n"
+        f"💰 *Total:* {total:,.2f} ETB\n"
+        f"📍 *Delivery to:* {order['delivery_address']}\n"
+        f"📞 *Phone:* {order['phone_number']}\n\n"
+        "💳 *Payment Instructions:*\n"
+        "Please send the total via Telebirr or CBE to:\n"
+        "📱 Telebirr: `0918012966`\n\n"
+        "After payment, reply in this chat with your transaction reference number or a screenshot slip."
+    )
+    if user_id:
+        try:
+            await bot_app.bot.send_message(
+                chat_id=user_id,
+                text=customer_msg,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to message buyer {user_id}: {e}")
+
+    # Admin alert
+    if ADMIN_CHAT_ID:
+        admin_msg = (
+            f"🚨 *New Order Alert: #{order['id']}*\n"
+            f"👤 *Customer:* {order['customer_name']}\n"
+            f"📱 *Phone:* {order['phone_number']}\n"
+            f"📍 *Address:* {order['delivery_address']}\n"
+            f"💵 *Amount:* {total:,.2f} ETB\n"
+            f"📦 *Items:* {len(order.get('items', []))} item(s)"
+        )
+        try:
+            await bot_app.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=admin_msg,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to message admin: {e}")
 
 
 def run_web_server():
@@ -80,7 +185,7 @@ def run_web_server():
     server.serve_forever()
 
 
-# --- Conversation States for /addproduct ---
+# --- Admin Conversation States for /addproduct ---
 (
     WAITING_NAME,
     WAITING_CATEGORY,
@@ -113,59 +218,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-
-
-async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        raw_data = update.effective_message.web_app_data.data
-        data = json.loads(raw_data)
-        
-        customer_info = data.get("customer", {})
-        items = data.get("items", [])
-        
-        order_id = create_order(
-            telegram_user_id=update.effective_user.id,
-            customer_name=customer_info.get("name", "Unknown"),
-            phone_number=customer_info.get("phone", ""),
-            delivery_address=customer_info.get("address", ""),
-            delivery_notes=customer_info.get("notes", ""),
-            payment_method=data.get("payment_method", "MOBILE_MONEY"),
-            items=items
-        )
-
-        order = get_order_by_id(order_id)
-        total = float(order["total_amount"])
-
-        customer_msg = (
-            f"✅ *Order #{order_id} Confirmed!*\n\n"
-            f"💰 *Total:* {total:,.2f} ETB\n"
-            f"📍 *Delivery to:* {order['delivery_address']}\n"
-            f"📞 *Phone:* {order['phone_number']}\n\n"
-            "💳 *Payment Instructions:*\n"
-            "Please send the total via Telebirr or CBE to:\n"
-            "📱 Telebirr: `0918012966`\n\n"
-            "After payment, reply to this chat with your transaction reference number or a screenshot slip."
-        )
-        await update.message.reply_text(customer_msg, parse_mode="Markdown")
-
-        if ADMIN_CHAT_ID:
-            admin_msg = (
-                f"🚨 *New Order Alert: #{order_id}*\n"
-                f"👤 *Customer:* {order['customer_name']} (@{update.effective_user.username or 'NoUsername'})\n"
-                f"📱 *Phone:* {order['phone_number']}\n"
-                f"📍 *Address:* {order['delivery_address']}\n"
-                f"💵 *Amount:* {total:,.2f} ETB\n"
-                f"📦 *Items:* {len(order.get('items', []))} item(s)"
-            )
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=admin_msg,
-                parse_mode="Markdown"
-            )
-
-    except Exception as e:
-        logger.error(f"Error handling WebApp data: {e}", exc_info=True)
-        await update.message.reply_text("❌ An error occurred while saving your order. Please try again.")
 
 
 async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,18 +348,17 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def main():
+    global bot_app, main_loop
     init_db()
-    
-    # Start Render health check and product API server in background
+
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    main_loop = asyncio.get_event_loop()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
-
-    app.add_handler(CommandHandler("catalog", catalog))
-    app.add_handler(CommandHandler("deleteproduct", delete_product_cmd))
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("catalog", catalog))
+    bot_app.add_handler(CommandHandler("deleteproduct", delete_product_cmd))
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("addproduct", add_product_start)],
@@ -325,10 +376,10 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
-    app.add_handler(conv_handler)
+    bot_app.add_handler(conv_handler)
 
     logger.info("Bot started and listening...")
-    app.run_polling()
+    bot_app.run_polling()
 
 
 if __name__ == "__main__":

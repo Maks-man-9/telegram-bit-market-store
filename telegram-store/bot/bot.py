@@ -1,8 +1,9 @@
 import os
 import json
 import logging
-import asyncio
 import threading
+import urllib.request
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import (
     Update,
@@ -38,8 +39,24 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 
-bot_app: Application = None
-main_loop: asyncio.AbstractEventLoop = None
+
+# --- Direct Telegram Notification Sender (Thread-safe) ---
+def send_telegram_direct(chat_id: int, text: str):
+    """Sends a Telegram message using simple HTTP POST without asyncio conflicts."""
+    if not chat_id or not BOT_TOKEN:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={"User-Agent": "BotOrderDispatcher"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass
+    except Exception as e:
+        logger.error(f"Failed to deliver message to chat {chat_id}: {e}")
 
 
 # --- Combined Health Check & Order API Server ---
@@ -71,6 +88,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self._send_cors_headers()
+                self.send_header("Content-Length", str(len(err_payload)))
                 self.end_headers()
                 self.wfile.write(err_payload)
         else:
@@ -105,12 +123,31 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 order = get_order_by_id(order_id)
                 total = float(order["total_amount"])
 
-                # Dispatch notifications asynchronously via Telegram
-                if bot_app and main_loop:
-                    asyncio.run_coroutine_threadsafe(
-                        notify_order_created(order, user_id, total),
-                        main_loop
+                # Send Buyer Confirmation
+                customer_msg = (
+                    f"✅ *Order #{order['id']} Confirmed!*\n\n"
+                    f"💰 *Total:* {total:,.2f} ETB\n"
+                    f"📍 *Delivery to:* {order['delivery_address']}\n"
+                    f"📞 *Phone:* {order['phone_number']}\n\n"
+                    "💳 *Payment Instructions:*\n"
+                    "Please send the total via Telebirr or CBE to:\n"
+                    "📱 Telebirr: `0918012966`\n\n"
+                    "After payment, reply in this chat with your transaction reference number or a screenshot slip."
+                )
+                if user_id:
+                    send_telegram_direct(user_id, customer_msg)
+
+                # Send Admin Alert
+                if ADMIN_CHAT_ID:
+                    admin_msg = (
+                        f"🚨 *New Order Alert: #{order['id']}*\n"
+                        f"👤 *Customer:* {order['customer_name']}\n"
+                        f"📱 *Phone:* {order['phone_number']}\n"
+                        f"📍 *Address:* {order['delivery_address']}\n"
+                        f"💵 *Amount:* {total:,.2f} ETB\n"
+                        f"📦 *Items:* {len(order.get('items', []))} item(s)"
                     )
+                    send_telegram_direct(ADMIN_CHAT_ID, admin_msg)
 
                 resp = json.dumps({"status": "success", "order_id": order_id}).encode("utf-8")
                 self.send_response(200)
@@ -134,48 +171,6 @@ class WebRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         return
-
-
-async def notify_order_created(order: dict, user_id: int, total: float):
-    # Customer message
-    customer_msg = (
-        f"✅ *Order #{order['id']} Confirmed!*\n\n"
-        f"💰 *Total:* {total:,.2f} ETB\n"
-        f"📍 *Delivery to:* {order['delivery_address']}\n"
-        f"📞 *Phone:* {order['phone_number']}\n\n"
-        "💳 *Payment Instructions:*\n"
-        "Please send the total via Telebirr or CBE to:\n"
-        "📱 Telebirr: `0918012966`\n\n"
-        "After payment, reply in this chat with your transaction reference number or a screenshot slip."
-    )
-    if user_id:
-        try:
-            await bot_app.bot.send_message(
-                chat_id=user_id,
-                text=customer_msg,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Failed to message buyer {user_id}: {e}")
-
-    # Admin alert
-    if ADMIN_CHAT_ID:
-        admin_msg = (
-            f"🚨 *New Order Alert: #{order['id']}*\n"
-            f"👤 *Customer:* {order['customer_name']}\n"
-            f"📱 *Phone:* {order['phone_number']}\n"
-            f"📍 *Address:* {order['delivery_address']}\n"
-            f"💵 *Amount:* {total:,.2f} ETB\n"
-            f"📦 *Items:* {len(order.get('items', []))} item(s)"
-        )
-        try:
-            await bot_app.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=admin_msg,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Failed to message admin: {e}")
 
 
 def run_web_server():
@@ -348,17 +343,15 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def main():
-    global bot_app, main_loop
     init_db()
 
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    main_loop = asyncio.get_event_loop()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("catalog", catalog))
-    bot_app.add_handler(CommandHandler("deleteproduct", delete_product_cmd))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("catalog", catalog))
+    app.add_handler(CommandHandler("deleteproduct", delete_product_cmd))
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("addproduct", add_product_start)],
@@ -376,10 +369,10 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
-    bot_app.add_handler(conv_handler)
+    app.add_handler(conv_handler)
 
     logger.info("Bot started and listening...")
-    bot_app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":

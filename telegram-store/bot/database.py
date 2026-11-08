@@ -98,7 +98,13 @@ def get_active_products() -> List[Dict[str, Any]]:
     """)
     rows = cursor.fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+
+    products = []
+    for row in rows:
+        item = dict(row)
+        item["price"] = float(item["price"])
+        products.append(item)
+    return products
 
 def create_order(
     telegram_user_id: int,

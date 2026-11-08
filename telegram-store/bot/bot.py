@@ -37,23 +37,46 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 
-# --- Health Check Server for Render Web Service ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
+# --- Combined Health Check & API Server for Render ---
+class WebRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path == "/api/products":
+            try:
+                products = get_active_products()
+                payload = json.dumps(products).encode("utf-8")
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as e:
+                logger.error(f"Error serving /api/products: {e}", exc_info=True)
+                err_payload = json.dumps({"error": str(e)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(err_payload)))
+                self.end_headers()
+                self.wfile.write(err_payload)
+        else:
+            # Standard health check endpoint for Render
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        # Silence routine health check logs
+        # Silence routine health checks from cluttering the terminal
         return
 
 
-def run_health_server():
+def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Health check server active on port {port}")
+    server = HTTPServer(("0.0.0.0", port), WebRequestHandler)
+    logger.info(f"HTTP API & Health server active on port {port}")
     server.serve_forever()
 
 
@@ -275,8 +298,8 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 def main():
     init_db()
     
-    # Run the background HTTP health server so Render marks the service Live
-    threading.Thread(target=run_health_server, daemon=True).start()
+    # Start Render health check and product API server in background
+    threading.Thread(target=run_web_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 

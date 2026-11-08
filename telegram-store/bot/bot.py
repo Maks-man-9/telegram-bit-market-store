@@ -123,16 +123,18 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 order = get_order_by_id(order_id)
                 total = float(order["total_amount"])
 
-                # Send Buyer Confirmation
+                # Send Buyer Confirmation with updated payment details
                 customer_msg = (
                     f"✅ *Order #{order['id']} Confirmed!*\n\n"
                     f"💰 *Total:* {total:,.2f} ETB\n"
                     f"📍 *Delivery to:* {order['delivery_address']}\n"
                     f"📞 *Phone:* {order['phone_number']}\n\n"
                     "💳 *Payment Instructions:*\n"
-                    "Please send the total via Telebirr or CBE to:\n"
-                    "📱 Telebirr: `0918012966`\n\n"
-                    "After payment, reply in this chat with your transaction reference number or a screenshot slip."
+                    "Please transfer the total amount using either option below:\n\n"
+                    "📱 *Telebirr:* `0950438114`\n"
+                    "🏦 *CBE Account:* `1000665061047`\n"
+                    "👤 *Account Name:* Kidanemariam Sintayehu\n\n"
+                    "After payment, reply directly in this chat with your transaction reference number or upload your payment screenshot."
                 )
                 if user_id:
                     send_telegram_direct(user_id, customer_msg)
@@ -163,6 +165,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self._send_cors_headers()
+                self.send_header("Content-Length", str(len(err_resp)))
                 self.end_headers()
                 self.wfile.write(err_resp)
         else:

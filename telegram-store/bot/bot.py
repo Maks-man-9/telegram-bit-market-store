@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -11,7 +13,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ConversationHandler,
     filters,
     ContextTypes,
@@ -36,7 +37,27 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 
-# Conversation states for /addproduct
+# --- Health Check Server for Render Web Service ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        # Silence routine health check logs
+        return
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health check server active on port {port}")
+    server.serve_forever()
+
+
+# --- Conversation States for /addproduct ---
 (
     WAITING_NAME,
     WAITING_CATEGORY,
@@ -72,7 +93,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes order payloads sent from the Telegram Mini App."""
     try:
         raw_data = update.effective_message.web_app_data.data
         data = json.loads(raw_data)
@@ -105,7 +125,6 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await update.message.reply_text(customer_msg, parse_mode="Markdown")
 
-        # Notify Admin
         if ADMIN_CHAT_ID:
             admin_msg = (
                 f"🚨 *New Order Alert: #{order_id}*\n"
@@ -125,8 +144,6 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Error handling WebApp data: {e}", exc_info=True)
         await update.message.reply_text("❌ An error occurred while saving your order. Please try again.")
 
-
-# ------------------ ADMIN INVENTORY FLOWS ------------------
 
 async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -165,7 +182,6 @@ async def delete_product_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Please provide a valid numeric product ID.")
 
 
-# Conversation handler for /addproduct
 async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Unauthorized.")
@@ -259,17 +275,17 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 def main():
     init_db()
     
+    # Run the background HTTP health server so Render marks the service Live
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Core user handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
 
-    # Admin commands
     app.add_handler(CommandHandler("catalog", catalog))
     app.add_handler(CommandHandler("deleteproduct", delete_product_cmd))
 
-    # Interactive /addproduct wizard
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("addproduct", add_product_start)],
         states={

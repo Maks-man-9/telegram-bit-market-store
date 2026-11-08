@@ -4,7 +4,7 @@ if (tg) {
   tg.ready();
 }
 
-const API_URL = "https://telegram-bit-market-store-1.onrender.com/api/products";
+const API_BASE = "https://telegram-bit-market-store-1.onrender.com";
 
 let products = [];
 let cart = {}; // { productId: quantity }
@@ -27,10 +27,22 @@ document.addEventListener("DOMContentLoaded", () => {
   const checkoutModal = document.getElementById("checkoutModal");
   const closeCheckoutBtn = document.getElementById("closeCheckoutBtn");
   const checkoutForm = document.getElementById("checkoutForm");
+  const submitOrderBtn = document.getElementById("submitOrderBtn");
   const custName = document.getElementById("custName");
   const custPhone = document.getElementById("custPhone");
   const custAddress = document.getElementById("custAddress");
   const custNotes = document.getElementById("custNotes");
+
+  // Autofill name from Telegram profile if available
+  if (tg?.initDataUnsafe?.user?.first_name && custName) {
+    const fullName = [
+      tg.initDataUnsafe.user.first_name,
+      tg.initDataUnsafe.user.last_name,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    custName.value = fullName;
+  }
 
   // Fetch active products from Render API
   async function loadProducts() {
@@ -44,7 +56,7 @@ document.addEventListener("DOMContentLoaded", () => {
     `;
 
     try {
-      const response = await fetch(API_URL);
+      const response = await fetch(`${API_BASE}/api/products`);
       if (!response.ok) {
         throw new Error(`HTTP error: ${response.status}`);
       }
@@ -309,14 +321,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Checkout form submit
   if (checkoutForm) {
-    checkoutForm.addEventListener("submit", (e) => {
+    checkoutForm.addEventListener("submit", async (e) => {
       e.preventDefault();
+
+      if (submitOrderBtn) {
+        submitOrderBtn.disabled = true;
+        submitOrderBtn.innerHTML = `<span>Transmitting Order...</span>`;
+      }
 
       const selectedPayment =
         document.querySelector('input[name="paymentMethod"]:checked')?.value ||
         "MOBILE_MONEY";
 
+      // Telegram User ID from Telegram WebApp SDK
+      const telegramUserId = tg?.initDataUnsafe?.user?.id || 0;
+
       const orderPayload = {
+        user_id: telegramUserId,
         customer: {
           name: custName ? custName.value.trim() : "Unknown",
           phone: custPhone ? custPhone.value.trim() : "",
@@ -330,16 +351,36 @@ document.addEventListener("DOMContentLoaded", () => {
         })),
       };
 
-      if (tg) {
-        tg.sendData(JSON.stringify(orderPayload));
-        tg.close();
-      } else {
-        alert("Order placed successfully! (Test browser mode)");
-        console.log("Transmitted payload:", orderPayload);
+      try {
+        const res = await fetch(`${API_BASE}/api/order`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(orderPayload),
+        });
+
+        const result = await res.json();
+
+        if (res.ok && result.status === "success") {
+          if (tg) {
+            tg.close();
+          } else {
+            alert(`Order #${result.order_id} placed successfully!`);
+            window.location.reload();
+          }
+        } else {
+          throw new Error(result.message || "Failed to process order.");
+        }
+      } catch (err) {
+        console.error("Order transmission failed:", err);
+        alert(`Order error: ${err.message}`);
+        if (submitOrderBtn) {
+          submitOrderBtn.disabled = false;
+          submitOrderBtn.innerHTML = `<span>Confirm & Transmit Order</span>`;
+        }
       }
     });
   }
 
-  // Load the catalog
+  // Start data loading
   loadProducts();
 });
